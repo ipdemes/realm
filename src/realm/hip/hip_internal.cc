@@ -1248,8 +1248,11 @@ namespace Realm {
               args->src_stride = istride;
               args->count = elems;
 
-              size_t threads_per_block = 256;
-              size_t blocks_per_grid = 1 + ((elems - 1) / threads_per_block);
+              // Use 128 threads per block instead of 256 to reduce resource requirements
+              // Reduction kernels can have high register usage
+              size_t threads_per_block = 128;
+              size_t blocks_per_grid = std::min(1 + ((elems - 1) / threads_per_block),
+                                                 static_cast<size_t>(2048));
 
               // void *extra[] = {
               //   CU_LAUNCH_PARAM_BUFFER_POINTER, args,

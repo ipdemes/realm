@@ -2435,30 +2435,23 @@ namespace Realm {
                   
                   log_gpudma.info() << "reduction kernel attributes: regs/thread=" << regs_per_thread
                                     << " static_shmem=" << static_shared_mem 
-                                    << " const_mem=" << const_mem << " elems=" << elems;
+                                    << " const_mem=" << const_mem << " elems=" << elems
+                                    << " args_size=" << args_size;
                   
-                  // Occupancy checks are unreliable for high-register kernels
-                  // Use a very conservative approach based on register usage
-                  if(regs_per_thread > 128) {
-                    // Extremely high register usage - be very conservative
-                    threads_per_block = 32;
-                    log_gpudma.warning() << "kernel uses " << regs_per_thread 
-                                         << " regs/thread, using only 32 threads/block";
-                  } else if(regs_per_thread > 64) {
-                    // High register usage
-                    threads_per_block = 64;
-                    log_gpudma.info() << "kernel uses " << regs_per_thread 
-                                      << " regs/thread, using 64 threads/block";
-                  } else if(regs_per_thread > 32) {
-                    // Moderate register usage
-                    threads_per_block = 128;
-                  } else {
-                    // Low register usage, can use more threads
-                    threads_per_block = 256;
+                  // Something is very wrong - low resource usage but still failing
+                  // Try with minimal configuration and see if it's an args_size issue
+                  if(args_size > 256) {
+                    log_gpudma.warning() << "large args_size detected (" << args_size 
+                                         << " bytes), may exceed CUDA parameter limits";
                   }
                   
-                  blocks_per_grid = std::min(1 + ((elems - 1) / threads_per_block),
-                                             static_cast<size_t>(1024));
+                  // Start with absolute minimum - single block, minimal threads
+                  // If this still fails, the problem is not about resources
+                  threads_per_block = 32;
+                  blocks_per_grid = 1;  // Just ONE block to rule out grid size issues
+                  
+                  log_gpudma.info() << "using minimal config: threads=" << threads_per_block 
+                                    << " blocks=" << blocks_per_grid;
                   
                   void *extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, args,
                                    CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
