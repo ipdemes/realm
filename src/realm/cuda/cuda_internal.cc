@@ -2424,48 +2424,37 @@ namespace Realm {
                 AutoGPUContext agc(channel->gpu);
 
                 if(kernel != 0) {
-                  // Query occupancy to determine safe launch parameters
-                  int min_grid_size = 0, suggested_block_size = 0;
-                  CUresult res = CUDA_DRIVER_FNPTR(cuOccupancyMaxPotentialBlockSize)(
-                      &min_grid_size, &suggested_block_size, kernel, 0, 0, 0);
+                  // Query kernel attributes to understand resource usage
+                  int regs_per_thread = 0, static_shared_mem = 0, const_mem = 0;
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&regs_per_thread, 
+                      CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&static_shared_mem, 
+                      CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&const_mem, 
+                      CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, kernel);
                   
-                  // Don't trust the occupancy API blindly - reduction kernels can have
-                  // extremely high register usage. Cap suggested size to be more conservative.
-                  if(res == CUDA_SUCCESS && suggested_block_size > 0) {
-                    // Cap at 256 threads even if occupancy suggests more
-                    threads_per_block = std::min(suggested_block_size, 256);
-                    log_gpudma.info() << "reduction kernel occupancy: suggested=" 
-                                      << suggested_block_size << " using=" << threads_per_block 
-                                      << " elems=" << elems;
-                  } else {
-                    // Fall back to conservative values if occupancy query fails
+                  log_gpudma.info() << "reduction kernel attributes: regs/thread=" << regs_per_thread
+                                    << " static_shmem=" << static_shared_mem 
+                                    << " const_mem=" << const_mem << " elems=" << elems;
+                  
+                  // Occupancy checks are unreliable for high-register kernels
+                  // Use a very conservative approach based on register usage
+                  if(regs_per_thread > 128) {
+                    // Extremely high register usage - be very conservative
+                    threads_per_block = 32;
+                    log_gpudma.warning() << "kernel uses " << regs_per_thread 
+                                         << " regs/thread, using only 32 threads/block";
+                  } else if(regs_per_thread > 64) {
+                    // High register usage
+                    threads_per_block = 64;
+                    log_gpudma.info() << "kernel uses " << regs_per_thread 
+                                      << " regs/thread, using 64 threads/block";
+                  } else if(regs_per_thread > 32) {
+                    // Moderate register usage
                     threads_per_block = 128;
-                    log_gpudma.warning() << "reduction kernel occupancy query failed (res=" 
-                                         << res << "), using fallback: threads_per_block=" 
-                                         << threads_per_block;
-                  }
-                  
-                  // Verify the configuration is actually launchable by trying progressively
-                  // smaller thread counts until we find one that works
-                  int num_blocks_per_sm = 0;
-                  std::vector<int> try_sizes = {static_cast<int>(threads_per_block), 128, 64, 32};
-                  bool found_valid_config = false;
-                  
-                  for(int try_threads : try_sizes) {
-                    CUresult verify_res = CUDA_DRIVER_FNPTR(cuOccupancyMaxActiveBlocksPerMultiprocessor)(
-                        &num_blocks_per_sm, kernel, try_threads, 0);
-                    if(verify_res == CUDA_SUCCESS && num_blocks_per_sm > 0) {
-                      threads_per_block = try_threads;
-                      found_valid_config = true;
-                      log_gpudma.info() << "verified threads_per_block=" << threads_per_block 
-                                        << " achieves " << num_blocks_per_sm << " blocks/SM";
-                      break;
-                    }
-                  }
-                  
-                  if(!found_valid_config) {
-                    log_gpudma.error() << "could not find valid launch configuration for reduction kernel!";
-                    threads_per_block = 32; // last resort
+                  } else {
+                    // Low register usage, can use more threads
+                    threads_per_block = 256;
                   }
                   
                   blocks_per_grid = std::min(1 + ((elems - 1) / threads_per_block),
