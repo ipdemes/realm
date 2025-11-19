@@ -2428,51 +2428,48 @@ namespace Realm {
                   int min_grid_size = 0, suggested_block_size = 0;
                   CUresult res = CUDA_DRIVER_FNPTR(cuOccupancyMaxPotentialBlockSize)(
                       &min_grid_size, &suggested_block_size, kernel, 0, 0, 0);
+                  
+                  // Don't trust the occupancy API blindly - reduction kernels can have
+                  // extremely high register usage. Cap suggested size to be more conservative.
                   if(res == CUDA_SUCCESS && suggested_block_size > 0) {
-                    threads_per_block = suggested_block_size;
-                    blocks_per_grid = std::min(1 + ((elems - 1) / threads_per_block),
-                                               static_cast<size_t>(CUDA_MAX_BLOCKS_PER_GRID));
-                    log_gpudma.info() << "reduction kernel occupancy: suggested_block_size=" 
-                                      << suggested_block_size << " blocks_per_grid=" 
-                                      << blocks_per_grid << " elems=" << elems;
+                    // Cap at 256 threads even if occupancy suggests more
+                    threads_per_block = std::min(suggested_block_size, 256);
+                    log_gpudma.info() << "reduction kernel occupancy: suggested=" 
+                                      << suggested_block_size << " using=" << threads_per_block 
+                                      << " elems=" << elems;
                   } else {
                     // Fall back to conservative values if occupancy query fails
                     threads_per_block = 128;
-                    blocks_per_grid = std::min(1 + ((elems - 1) / threads_per_block),
-                                               static_cast<size_t>(CUDA_MAX_BLOCKS_PER_GRID));
                     log_gpudma.warning() << "reduction kernel occupancy query failed (res=" 
-                                         << res << "), using fallback: threads_per_block=128, blocks=" 
-                                         << blocks_per_grid;
+                                         << res << "), using fallback: threads_per_block=" 
+                                         << threads_per_block;
                   }
                   
-                  // Clamp blocks to reasonable maximum for safety
-                  if(blocks_per_grid > 1024) {
-                    log_gpudma.warning() << "clamping blocks_per_grid from " << blocks_per_grid 
-                                         << " to 1024 for reduction kernel";
-                    blocks_per_grid = 1024;
-                  }
-                  
-                  // Verify the configuration is actually launchable
+                  // Verify the configuration is actually launchable by trying progressively
+                  // smaller thread counts until we find one that works
                   int num_blocks_per_sm = 0;
-                  CUresult verify_res = CUDA_DRIVER_FNPTR(cuOccupancyMaxActiveBlocksPerMultiprocessor)(
-                      &num_blocks_per_sm, kernel, threads_per_block, 0);
-                  if(verify_res == CUDA_SUCCESS && num_blocks_per_sm == 0) {
-                    // Configuration not launchable, reduce thread count
-                    log_gpudma.warning() << "kernel config not launchable with " << threads_per_block 
-                                         << " threads, trying smaller sizes";
-                    for(int try_threads : {64, 32, 16}) {
-                      verify_res = CUDA_DRIVER_FNPTR(cuOccupancyMaxActiveBlocksPerMultiprocessor)(
-                          &num_blocks_per_sm, kernel, try_threads, 0);
-                      if(verify_res == CUDA_SUCCESS && num_blocks_per_sm > 0) {
-                        threads_per_block = try_threads;
-                        blocks_per_grid = std::min(1 + ((elems - 1) / threads_per_block),
-                                                   static_cast<size_t>(1024));
-                        log_gpudma.info() << "using threads_per_block=" << threads_per_block 
-                                          << " (achieves " << num_blocks_per_sm << " blocks/SM)";
-                        break;
-                      }
+                  std::vector<int> try_sizes = {static_cast<int>(threads_per_block), 128, 64, 32};
+                  bool found_valid_config = false;
+                  
+                  for(int try_threads : try_sizes) {
+                    CUresult verify_res = CUDA_DRIVER_FNPTR(cuOccupancyMaxActiveBlocksPerMultiprocessor)(
+                        &num_blocks_per_sm, kernel, try_threads, 0);
+                    if(verify_res == CUDA_SUCCESS && num_blocks_per_sm > 0) {
+                      threads_per_block = try_threads;
+                      found_valid_config = true;
+                      log_gpudma.info() << "verified threads_per_block=" << threads_per_block 
+                                        << " achieves " << num_blocks_per_sm << " blocks/SM";
+                      break;
                     }
                   }
+                  
+                  if(!found_valid_config) {
+                    log_gpudma.error() << "could not find valid launch configuration for reduction kernel!";
+                    threads_per_block = 32; // last resort
+                  }
+                  
+                  blocks_per_grid = std::min(1 + ((elems - 1) / threads_per_block),
+                                             static_cast<size_t>(1024));
                   
                   void *extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, args,
                                    CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
