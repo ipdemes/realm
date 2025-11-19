@@ -2424,31 +2424,45 @@ namespace Realm {
                 AutoGPUContext agc(channel->gpu);
 
                 if(kernel != 0) {
-                  // Query kernel attributes to understand resource usage
+                  // Query ALL kernel attributes to find the problem
                   int regs_per_thread = 0, static_shared_mem = 0, const_mem = 0;
+                  int local_mem = 0, ptx_version = 0, binary_version = 0;
+                  int max_threads = 0, preferred_shmem_carveout = 0;
+                  
                   CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&regs_per_thread, 
                       CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
                   CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&static_shared_mem, 
                       CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel);
                   CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&const_mem, 
                       CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&local_mem, 
+                      CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&max_threads, 
+                      CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&ptx_version, 
+                      CU_FUNC_ATTRIBUTE_PTX_VERSION, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&binary_version, 
+                      CU_FUNC_ATTRIBUTE_BINARY_VERSION, kernel);
                   
                   log_gpudma.info() << "reduction kernel attributes: regs/thread=" << regs_per_thread
                                     << " static_shmem=" << static_shared_mem 
-                                    << " const_mem=" << const_mem << " elems=" << elems
+                                    << " local_mem=" << local_mem
+                                    << " const_mem=" << const_mem 
+                                    << " max_threads=" << max_threads
+                                    << " ptx_ver=" << ptx_version
+                                    << " binary_ver=" << binary_version
+                                    << " elems=" << elems
                                     << " args_size=" << args_size;
                   
-                  // Something is very wrong - low resource usage but still failing
-                  // Try with minimal configuration and see if it's an args_size issue
-                  if(args_size > 256) {
-                    log_gpudma.warning() << "large args_size detected (" << args_size 
-                                         << " bytes), may exceed CUDA parameter limits";
+                  // If local memory is huge, that's the problem
+                  if(local_mem > 0) {
+                    log_gpudma.error() << "kernel uses LOCAL MEMORY: " << local_mem 
+                                       << " bytes/thread - this is likely the cause!";
                   }
                   
-                  // Start with absolute minimum - single block, minimal threads
-                  // If this still fails, the problem is not about resources
+                  // Use minimal configuration - if this fails, kernel is broken
                   threads_per_block = 32;
-                  blocks_per_grid = 1;  // Just ONE block to rule out grid size issues
+                  blocks_per_grid = 1;
                   
                   log_gpudma.info() << "using minimal config: threads=" << threads_per_block 
                                     << " blocks=" << blocks_per_grid;
