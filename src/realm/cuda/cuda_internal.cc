@@ -2444,6 +2444,14 @@ namespace Realm {
                   CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&binary_version, 
                       CU_FUNC_ATTRIBUTE_BINARY_VERSION, kernel);
                   
+                  // Get kernel name for debugging
+                  const char *kernel_name = nullptr;
+                  CUresult name_res = CUDA_DRIVER_FNPTR(cuFuncGetName)(&kernel_name, kernel);
+                  
+                  log_gpudma.info() << "reduction kernel: name=" << (name_res == CUDA_SUCCESS && kernel_name ? kernel_name : "UNKNOWN")
+                                    << " redop_id=" << redop_info.id
+                                    << " is_fold=" << redop_info.is_fold
+                                    << " is_exclusive=" << redop_info.is_exclusive;
                   log_gpudma.info() << "reduction kernel attributes: regs/thread=" << regs_per_thread
                                     << " static_shmem=" << static_shared_mem 
                                     << " local_mem=" << local_mem
@@ -2467,13 +2475,40 @@ namespace Realm {
                   log_gpudma.info() << "using minimal config: threads=" << threads_per_block 
                                     << " blocks=" << blocks_per_grid;
                   
+                  // The kernel takes parameters: (base, stride, base, stride, count, REDOP_by_value)
+                  // The REDOP is passed by value, not pointer
+                  // Use buffer pointer method which should work with the flat args layout
                   void *extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, args,
                                    CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
                                    CU_LAUNCH_PARAM_END};
+                  
+                  log_gpudma.info() << "launching with buffer: dst=" << std::hex << args->dst_base
+                                    << " src=" << args->src_base << std::dec
+                                    << " count=" << args->count
+                                    << " userdata_size=" << redop->sizeof_userdata;
 
-                  CHECK_CU(CUDA_DRIVER_FNPTR(cuLaunchKernel)(
+                  // THIS IS THE LAUNCH THAT'S FAILING - let's try catching the error differently
+                  CUresult launch_result = CUDA_DRIVER_FNPTR(cuLaunchKernel)(
                       kernel, blocks_per_grid, 1, 1, threads_per_block, 1, 1,
-                      0 /*sharedmem*/, stream->get_stream(), 0 /*params*/, extra));
+                      0 /*sharedmem*/, stream->get_stream(), 0 /*params*/, extra);
+                  
+                  if(launch_result != CUDA_SUCCESS) {
+                    // Try to get more info about WHY it failed
+                    const char *err_name = nullptr, *err_string = nullptr;
+                    CUDA_DRIVER_FNPTR(cuGetErrorName)(launch_result, &err_name);
+                    CUDA_DRIVER_FNPTR(cuGetErrorString)(launch_result, &err_string);
+                    log_gpudma.error() << "Launch failed: " << (err_name ? err_name : "?")
+                                       << " - " << (err_string ? err_string : "?");
+                    
+                    // Try with even fewer threads as last resort
+                    log_gpudma.warning() << "Retrying with 1 thread...";
+                    threads_per_block = 1;
+                    launch_result = CUDA_DRIVER_FNPTR(cuLaunchKernel)(
+                        kernel, blocks_per_grid, 1, 1, threads_per_block, 1, 1,
+                        0, stream->get_stream(), 0, extra);
+                  }
+                  
+                  CHECK_CU(launch_result);
                 } else {
                   // For runtime API path, use conservative thread count
                   threads_per_block = 128;
