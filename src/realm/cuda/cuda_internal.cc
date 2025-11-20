@@ -2609,11 +2609,10 @@ namespace Realm {
                   // to see if it's a resource issue or something else
                   log_gpudma.info() << "  === MINIMAL LAUNCH TEST ===";
                   log_gpudma.info() << "  Attempting launch with 1 block, 1 thread...";
-                  void *test_extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, args,
-                                       CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
-                                       CU_LAUNCH_PARAM_END};
+                  void *test_params[] = {&args->dst_base,   &args->dst_stride, &args->src_base,
+                                        &args->src_stride, &args->count,      args + 1};
                   CUresult test_result = CUDA_DRIVER_FNPTR(cuLaunchKernel)(
-                      kernel, 1, 1, 1, 1, 1, 1, 0, stream->get_stream(), NULL, test_extra);
+                      kernel, 1, 1, 1, 1, 1, 1, 0, stream->get_stream(), test_params, NULL);
                   log_gpudma.info() << "  Minimal launch result: " << test_result;
                   if(test_result != CUDA_SUCCESS) {
                     const char *err_name = nullptr, *err_string = nullptr;
@@ -2631,18 +2630,20 @@ namespace Realm {
                   // Only proceed with full launch if minimal test succeeded OR to gather more info
                   log_gpudma.info() << "  === FULL LAUNCH ===";
                   
-                  void *extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, args,
-                                   CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
-                                   CU_LAUNCH_PARAM_END};
+                  // Use traditional params array instead of buffer pointer
+                  // This passes pointers to each parameter instead of a packed buffer
+                  void *params[] = {&args->dst_base,   &args->dst_stride, &args->src_base,
+                                    &args->src_stride, &args->count,      args + 1};
 
-                  log_gpudma.info() << "  Calling cuLaunchKernel with full parameters...";
+                  log_gpudma.info() << "  Calling cuLaunchKernel with params array...";
                   log_gpudma.info() << "    blocks: (" << blocks_per_grid << ", 1, 1)";
                   log_gpudma.info() << "    threads: (" << threads_per_block << ", 1, 1)";
                   log_gpudma.info() << "    shared_mem: 0";
+                  log_gpudma.info() << "    Using params[] instead of buffer pointer";
                   
                   CUresult launch_result = CUDA_DRIVER_FNPTR(cuLaunchKernel)(
                       kernel, blocks_per_grid, 1, 1, threads_per_block, 1, 1,
-                      0 /*sharedmem*/, stream->get_stream(), 0 /*params*/, extra);
+                      0 /*sharedmem*/, stream->get_stream(), params, 0 /*extra*/);
                   
                   log_gpudma.info() << "  cuLaunchKernel returned: " << launch_result;
                   
