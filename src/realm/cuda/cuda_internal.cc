@@ -2450,7 +2450,7 @@ namespace Realm {
                   // Use params array to pass kernel arguments
                   // This is more robust than CU_LAUNCH_PARAM_BUFFER_POINTER for small structs
                   void *params[] = {&args->dst_base,   &args->dst_stride, &args->src_base,
-                                    &args->src_stride, &args->count,      :/args + 1};
+                                    &args->src_stride, &args->count,      args + 1};
                   
                   CHECK_CU(CUDA_DRIVER_FNPTR(cuLaunchKernel)(
                       kernel, blocks_per_grid, 1, 1, threads_per_block, 1, 1,
