@@ -2246,6 +2246,7 @@ namespace Realm {
                                             : redop->cuda_apply_nonexcl_fn));
         if(redop->cudaGetFuncBySymbol_fn != 0) {
           // we can ask the runtime to perform the mapping for us
+          // CRITICAL: Must be in the correct GPU context!
           gpu->push_context();
 #ifdef REALM_USE_CUDART_HIJACK
           ThreadLocal::current_gpu_stream = stream;
@@ -2253,6 +2254,23 @@ namespace Realm {
           CHECK_CUDART(reinterpret_cast<PFN_cudaGetFuncBySymbol>(
               redop->cudaGetFuncBySymbol_fn)((void **)&kernel, host_proxy));
           gpu->pop_context();
+          
+          // Register this kernel in the GPU's reduction table for future use
+          {
+            AutoLock<Mutex> al(gpu->alloc_mutex);
+            GPU::GPUReductionOpEntry &entry = gpu->gpu_reduction_table[redop_info.id];
+            if(redop_info.is_fold) {
+              if(redop_info.is_exclusive)
+                entry.fold_excl = kernel;
+              else
+                entry.fold_nonexcl = kernel;
+            } else {
+              if(redop_info.is_exclusive)
+                entry.apply_excl = kernel;
+              else
+                entry.apply_nonexcl = kernel;
+            }
+          }
         } else {
           // no way to ask the runtime to perform the mapping, so we'll have
           //  to actually launch the kernels with the runtime API using the launch
@@ -2418,97 +2436,20 @@ namespace Realm {
               args->count = elems;
 
               size_t threads_per_block = 256;
-              size_t blocks_per_grid = 1 + ((elems - 1) / threads_per_block);
+              size_t blocks_per_grid = std::min(1 + ((elems - 1) / threads_per_block),
+                                                static_cast<size_t>(CUDA_MAX_BLOCKS_PER_GRID));
 
               {
                 AutoGPUContext agc(channel->gpu);
 
                 if(kernel != 0) {
-                  // Query ALL kernel attributes to find the problem
-                  int regs_per_thread = 0, static_shared_mem = 0, const_mem = 0;
-                  int local_mem = 0, ptx_version = 0, binary_version = 0;
-                  int max_threads = 0, preferred_shmem_carveout = 0;
-                  
-                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&regs_per_thread, 
-                      CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&static_shared_mem, 
-                      CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel);
-                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&const_mem, 
-                      CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, kernel);
-                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&local_mem, 
-                      CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
-                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&max_threads, 
-                      CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, kernel);
-                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&ptx_version, 
-                      CU_FUNC_ATTRIBUTE_PTX_VERSION, kernel);
-                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&binary_version, 
-                      CU_FUNC_ATTRIBUTE_BINARY_VERSION, kernel);
-                  
-                  // Get kernel name for debugging
-                  const char *kernel_name = nullptr;
-                  CUresult name_res = CUDA_DRIVER_FNPTR(cuFuncGetName)(&kernel_name, kernel);
-                  
-                  log_gpudma.info() << "reduction kernel: name=" << (name_res == CUDA_SUCCESS && kernel_name ? kernel_name : "UNKNOWN")
-                                    << " redop_id=" << redop_info.id
-                                    << " is_fold=" << redop_info.is_fold
-                                    << " is_exclusive=" << redop_info.is_exclusive;
-                  log_gpudma.info() << "reduction kernel attributes: regs/thread=" << regs_per_thread
-                                    << " static_shmem=" << static_shared_mem 
-                                    << " local_mem=" << local_mem
-                                    << " const_mem=" << const_mem 
-                                    << " max_threads=" << max_threads
-                                    << " ptx_ver=" << ptx_version
-                                    << " binary_ver=" << binary_version
-                                    << " elems=" << elems
-                                    << " args_size=" << args_size;
-                  
-                  // If local memory is huge, that's the problem
-                  if(local_mem > 0) {
-                    log_gpudma.error() << "kernel uses LOCAL MEMORY: " << local_mem 
-                                       << " bytes/thread - this is likely the cause!";
-                  }
-                  
-                  // Use minimal configuration - if this fails, kernel is broken
-                  threads_per_block = 32;
-                  blocks_per_grid = 1;
-                  
-                  log_gpudma.info() << "using minimal config: threads=" << threads_per_block 
-                                    << " blocks=" << blocks_per_grid;
-                  
-                  // The kernel takes parameters: (base, stride, base, stride, count, REDOP_by_value)
-                  // The REDOP is passed by value, not pointer
-                  // Use buffer pointer method which should work with the flat args layout
                   void *extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, args,
                                    CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
                                    CU_LAUNCH_PARAM_END};
-                  
-                  log_gpudma.info() << "launching with buffer: dst=" << std::hex << args->dst_base
-                                    << " src=" << args->src_base << std::dec
-                                    << " count=" << args->count
-                                    << " userdata_size=" << redop->sizeof_userdata;
 
-                  // THIS IS THE LAUNCH THAT'S FAILING - let's try catching the error differently
-                  CUresult launch_result = CUDA_DRIVER_FNPTR(cuLaunchKernel)(
+                  CHECK_CU(CUDA_DRIVER_FNPTR(cuLaunchKernel)(
                       kernel, blocks_per_grid, 1, 1, threads_per_block, 1, 1,
-                      0 /*sharedmem*/, stream->get_stream(), 0 /*params*/, extra);
-                  
-                  if(launch_result != CUDA_SUCCESS) {
-                    // Try to get more info about WHY it failed
-                    const char *err_name = nullptr, *err_string = nullptr;
-                    CUDA_DRIVER_FNPTR(cuGetErrorName)(launch_result, &err_name);
-                    CUDA_DRIVER_FNPTR(cuGetErrorString)(launch_result, &err_string);
-                    log_gpudma.error() << "Launch failed: " << (err_name ? err_name : "?")
-                                       << " - " << (err_string ? err_string : "?");
-                    
-                    // Try with even fewer threads as last resort
-                    log_gpudma.warning() << "Retrying with 1 thread...";
-                    threads_per_block = 1;
-                    launch_result = CUDA_DRIVER_FNPTR(cuLaunchKernel)(
-                        kernel, blocks_per_grid, 1, 1, threads_per_block, 1, 1,
-                        0, stream->get_stream(), 0, extra);
-                  }
-                  
-                  CHECK_CU(launch_result);
+                      0 /*sharedmem*/, stream->get_stream(), 0 /*params*/, extra));
                 } else {
                   // For runtime API path, use conservative thread count
                   threads_per_block = 128;
