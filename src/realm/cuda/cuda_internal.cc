@@ -2223,8 +2223,18 @@ namespace Realm {
       GPU *gpu = checked_cast<GPUreduceChannel *>(channel)->gpu;
       stream = gpu->get_next_d2d_stream();
 
+      log_gpudma.info() << "=== GPUreduceXferDes constructor START ===";
+      log_gpudma.info() << "  GPU index: " << gpu->info->index;
+      log_gpudma.info() << "  Redop ID: " << redop_info.id;
+      log_gpudma.info() << "  is_fold: " << redop_info.is_fold;
+      log_gpudma.info() << "  is_exclusive: " << redop_info.is_exclusive;
+      log_gpudma.info() << "  GPU ptr: " << std::hex << (void*)gpu << std::dec;
+
       {
         AutoLock<Mutex> al(gpu->alloc_mutex);
+        log_gpudma.info() << "  Checking GPU" << gpu->info->index << " reduction table (size=" 
+                          << gpu->gpu_reduction_table.size() << ")";
+        
         std::unordered_map<ReductionOpID, GPU::GPUReductionOpEntry>::const_iterator
             gpu_red_it = gpu->gpu_reduction_table.find(redop_info.id);
         if(gpu_red_it != gpu->gpu_reduction_table.end()) {
@@ -2233,10 +2243,18 @@ namespace Realm {
                                                    : gpu_red_it->second.fold_nonexcl)
                         : (redop_info.is_exclusive ? gpu_red_it->second.apply_excl
                                                    : gpu_red_it->second.apply_nonexcl));
+          log_gpudma.info() << "  FOUND cached kernel for GPU" << gpu->info->index 
+                            << " redop=" << redop_info.id 
+                            << " kernel=" << std::hex << (void*)kernel << std::dec;
+        } else {
+          log_gpudma.info() << "  NOT FOUND in cache for GPU" << gpu->info->index 
+                            << " redop=" << redop_info.id << " - will obtain new one";
         }
       }
 
       if(kernel == nullptr) {
+        log_gpudma.info() << "  Kernel is nullptr, obtaining via fallback";
+        
         // select reduction kernel now - translate to CUfunction if possible
         void *host_proxy =
             (redop_info.is_fold
@@ -2244,21 +2262,53 @@ namespace Realm {
                                             : redop->cuda_fold_nonexcl_fn)
                  : (redop_info.is_exclusive ? redop->cuda_apply_excl_fn
                                             : redop->cuda_apply_nonexcl_fn));
+        
+        log_gpudma.info() << "  host_proxy=" << std::hex << host_proxy << std::dec;
+        log_gpudma.info() << "  cudaGetFuncBySymbol_fn=" << std::hex 
+                          << (void*)redop->cudaGetFuncBySymbol_fn << std::dec;
+        
         if(redop->cudaGetFuncBySymbol_fn != 0) {
           // we can ask the runtime to perform the mapping for us
           // CRITICAL: Must be in the correct GPU context!
+          CUcontext ctx_before, ctx_after, ctx_final;
+          CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&ctx_before);
+          
+          log_gpudma.info() << "  Calling cudaGetFuncBySymbol for GPU" << gpu->info->index;
+          log_gpudma.info() << "    ctx_before_push=" << std::hex << (void*)ctx_before << std::dec;
+          
           gpu->push_context();
+          CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&ctx_after);
+          
+          log_gpudma.info() << "    ctx_after_push=" << std::hex << (void*)ctx_after << std::dec;
+          
 #ifdef REALM_USE_CUDART_HIJACK
           ThreadLocal::current_gpu_stream = stream;
+          log_gpudma.info() << "    Set current_gpu_stream (hijack enabled)";
 #endif
-          CHECK_CUDART(reinterpret_cast<PFN_cudaGetFuncBySymbol>(
-              redop->cudaGetFuncBySymbol_fn)((void **)&kernel, host_proxy));
+          
+          CUresult result = reinterpret_cast<PFN_cudaGetFuncBySymbol>(
+              redop->cudaGetFuncBySymbol_fn)((void **)&kernel, host_proxy);
+          
+          log_gpudma.info() << "    cudaGetFuncBySymbol returned: " << result;
+          log_gpudma.info() << "    Got kernel=" << std::hex << (void*)kernel << std::dec;
+          
+          CHECK_CUDART(result);
+          
+          CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&ctx_final);
+          log_gpudma.info() << "    ctx_after_call=" << std::hex << (void*)ctx_final << std::dec;
+          
           gpu->pop_context();
           
           // Register this kernel in the GPU's reduction table for future use
           {
             AutoLock<Mutex> al(gpu->alloc_mutex);
             GPU::GPUReductionOpEntry &entry = gpu->gpu_reduction_table[redop_info.id];
+            log_gpudma.info() << "  Registering kernel in GPU" << gpu->info->index << " reduction table";
+            log_gpudma.info() << "    Before: apply_excl=" << std::hex << (void*)entry.apply_excl
+                              << " apply_nonexcl=" << (void*)entry.apply_nonexcl
+                              << " fold_excl=" << (void*)entry.fold_excl
+                              << " fold_nonexcl=" << (void*)entry.fold_nonexcl << std::dec;
+            
             if(redop_info.is_fold) {
               if(redop_info.is_exclusive)
                 entry.fold_excl = kernel;
@@ -2270,15 +2320,24 @@ namespace Realm {
               else
                 entry.apply_nonexcl = kernel;
             }
+            
+            log_gpudma.info() << "    After: apply_excl=" << std::hex << (void*)entry.apply_excl
+                              << " apply_nonexcl=" << (void*)entry.apply_nonexcl
+                              << " fold_excl=" << (void*)entry.fold_excl
+                              << " fold_nonexcl=" << (void*)entry.fold_nonexcl << std::dec;
           }
         } else {
           // no way to ask the runtime to perform the mapping, so we'll have
           //  to actually launch the kernels with the runtime API using the launch
           //  kernel function provided
+          log_gpudma.info() << "  No cudaGetFuncBySymbol, using cudaLaunchKernel fallback";
           kernel_host_proxy = host_proxy;
           assert(redop->cudaLaunchKernel_fn != 0);
         }
       }
+      log_gpudma.info() << "=== GPUreduceXferDes constructor END: kernel=" 
+                        << std::hex << (void*)kernel 
+                        << " host_proxy=" << (void*)kernel_host_proxy << std::dec << " ===";
     }
 
     long GPUreduceXferDes::get_requests(Request **requests, long nr)
@@ -2443,13 +2502,51 @@ namespace Realm {
                 AutoGPUContext agc(channel->gpu);
 
                 if(kernel != 0) {
+                  CUcontext launch_ctx;
+                  CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&launch_ctx);
+                  
+                  log_gpudma.info() << "=== KERNEL LAUNCH ===";
+                  log_gpudma.info() << "  kernel ptr: " << std::hex << (void*)kernel << std::dec;
+                  log_gpudma.info() << "  channel GPU: " << channel->gpu->info->index;
+                  log_gpudma.info() << "  launch ctx: " << std::hex << (void*)launch_ctx << std::dec;
+                  log_gpudma.info() << "  stream: " << std::hex << (void*)stream->get_stream() << std::dec;
+                  log_gpudma.info() << "  threads_per_block: " << threads_per_block;
+                  log_gpudma.info() << "  blocks_per_grid: " << blocks_per_grid;
+                  log_gpudma.info() << "  elems: " << elems;
+                  log_gpudma.info() << "  args_size: " << args_size;
+                  log_gpudma.info() << "  dst_base: " << std::hex << args->dst_base << std::dec;
+                  log_gpudma.info() << "  src_base: " << std::hex << args->src_base << std::dec;
+                  
+                  // Query kernel attributes
+                  int regs = 0, shmem = 0, lmem = 0;
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&shmem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&lmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+                  
+                  log_gpudma.info() << "  kernel regs/thread: " << regs;
+                  log_gpudma.info() << "  kernel static_shmem: " << shmem;
+                  log_gpudma.info() << "  kernel local_mem: " << lmem;
+                  
                   void *extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, args,
                                    CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
                                    CU_LAUNCH_PARAM_END};
 
-                  CHECK_CU(CUDA_DRIVER_FNPTR(cuLaunchKernel)(
+                  log_gpudma.info() << "  Calling cuLaunchKernel...";
+                  CUresult launch_result = CUDA_DRIVER_FNPTR(cuLaunchKernel)(
                       kernel, blocks_per_grid, 1, 1, threads_per_block, 1, 1,
-                      0 /*sharedmem*/, stream->get_stream(), 0 /*params*/, extra));
+                      0 /*sharedmem*/, stream->get_stream(), 0 /*params*/, extra);
+                  
+                  log_gpudma.info() << "  cuLaunchKernel returned: " << launch_result;
+                  
+                  if(launch_result != CUDA_SUCCESS) {
+                    const char *err_name = nullptr, *err_string = nullptr;
+                    CUDA_DRIVER_FNPTR(cuGetErrorName)(launch_result, &err_name);
+                    CUDA_DRIVER_FNPTR(cuGetErrorString)(launch_result, &err_string);
+                    log_gpudma.error() << "  LAUNCH FAILED: " << (err_name ? err_name : "?")
+                                       << " - " << (err_string ? err_string : "?");
+                  }
+                  
+                  CHECK_CU(launch_result);
                 } else {
                   // For runtime API path, use conservative thread count
                   threads_per_block = 128;
