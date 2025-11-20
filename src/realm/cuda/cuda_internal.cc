@@ -2272,7 +2272,33 @@ namespace Realm {
           // CRITICAL: Must be in the correct GPU context!
           log_gpudma.info() << "  Calling cudaGetFuncBySymbol for GPU" << gpu->info->index;
           
+          // Check context BEFORE push
+          CUcontext ctx_before = nullptr;
+          CUdevice dev_before = -1;
+          CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&ctx_before);
+          if(ctx_before) {
+            CUDA_DRIVER_FNPTR(cuCtxGetDevice)(&dev_before);
+          }
+          log_gpudma.info() << "    BEFORE push_context: ctx=" << std::hex << (void*)ctx_before 
+                            << " dev=" << std::dec << dev_before;
+          
           gpu->push_context();
+          
+          // Check context AFTER push
+          CUcontext ctx_after = nullptr;
+          CUdevice dev_after = -1;
+          CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&ctx_after);
+          if(ctx_after) {
+            CUDA_DRIVER_FNPTR(cuCtxGetDevice)(&dev_after);
+          }
+          log_gpudma.info() << "    AFTER push_context: ctx=" << std::hex << (void*)ctx_after 
+                            << " dev=" << std::dec << dev_after;
+          
+          if(dev_after != gpu->info->index) {
+            log_gpudma.error() << "    CRITICAL ERROR: After push_context, device mismatch!"
+                               << " Expected GPU" << gpu->info->index 
+                               << " but got device " << dev_after;
+          }
           
 #ifdef REALM_USE_CUDART_HIJACK
           ThreadLocal::current_gpu_stream = stream;
@@ -2284,6 +2310,11 @@ namespace Realm {
           
           log_gpudma.info() << "    cudaGetFuncBySymbol returned: " << result;
           log_gpudma.info() << "    Got kernel=" << std::hex << (void*)kernel << std::dec;
+          
+          // Check which context this kernel belongs to
+          CUcontext kernel_ctx = nullptr;
+          CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&kernel_ctx);
+          log_gpudma.info() << "    Kernel obtained in context: " << std::hex << (void*)kernel_ctx << std::dec;
           
           CHECK_CUDART(result);
           
@@ -2496,6 +2527,23 @@ namespace Realm {
                   log_gpudma.info() << "  kernel ptr: " << std::hex << (void*)kernel << std::dec;
                   log_gpudma.info() << "  channel GPU: " << channel->gpu->info->index;
                   log_gpudma.info() << "  stream: " << std::hex << (void*)stream->get_stream() << std::dec;
+                  
+                  // Check current CUDA context
+                  CUcontext current_ctx = nullptr;
+                  CUdevice current_dev = -1;
+                  CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&current_ctx);
+                  if(current_ctx) {
+                    CUDA_DRIVER_FNPTR(cuCtxGetDevice)(&current_dev);
+                  }
+                  log_gpudma.info() << "  current CUDA context: " << std::hex << (void*)current_ctx << std::dec;
+                  log_gpudma.info() << "  current CUDA device: " << current_dev;
+                  log_gpudma.info() << "  expected device: " << channel->gpu->info->index;
+                  
+                  if(current_dev != channel->gpu->info->index) {
+                    log_gpudma.warning() << "  CONTEXT MISMATCH! current_dev=" << current_dev 
+                                         << " != expected=" << channel->gpu->info->index;
+                  }
+                  
                   log_gpudma.info() << "  threads_per_block: " << threads_per_block;
                   log_gpudma.info() << "  blocks_per_grid: " << blocks_per_grid;
                   log_gpudma.info() << "  elems: " << elems;
@@ -2505,9 +2553,15 @@ namespace Realm {
                   
                   // Query kernel attributes
                   int regs = 0, shmem = 0, lmem = 0;
-                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&shmem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel);
-                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&lmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+                  CUresult attr_res1 = CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+                  CUresult attr_res2 = CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&shmem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel);
+                  CUresult attr_res3 = CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&lmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+                  
+                  if(attr_res1 != CUDA_SUCCESS || attr_res2 != CUDA_SUCCESS || attr_res3 != CUDA_SUCCESS) {
+                    log_gpudma.error() << "  cuFuncGetAttribute FAILED: res1=" << attr_res1 
+                                       << " res2=" << attr_res2 << " res3=" << attr_res3;
+                    log_gpudma.error() << "  This suggests the kernel is INVALID for current context!";
+                  }
                   
                   log_gpudma.info() << "  kernel regs/thread: " << regs;
                   log_gpudma.info() << "  kernel static_shmem: " << shmem;
