@@ -2493,7 +2493,7 @@ namespace Realm {
                 AutoGPUContext agc(channel->gpu);
 
                 if(kernel != 0) {
-                  log_gpudma.info() << "=== KERNEL LAUNCH ===";
+                  log_gpudma.info() << "=== KERNEL LAUNCH DEBUG ===";
                   log_gpudma.info() << "  kernel ptr: " << std::hex << (void*)kernel << std::dec;
                   log_gpudma.info() << "  channel GPU index: " << channel->gpu->info->index;
                   log_gpudma.info() << "  channel GPU context: " << std::hex << (void*)channel->gpu->context << std::dec;
@@ -2504,29 +2504,123 @@ namespace Realm {
                   log_gpudma.info() << "  args_size: " << args_size;
                   log_gpudma.info() << "  dst_base: " << std::hex << args->dst_base << std::dec;
                   log_gpudma.info() << "  src_base: " << std::hex << args->src_base << std::dec;
+                  log_gpudma.info() << "  dst_stride: " << args->dst_stride;
+                  log_gpudma.info() << "  src_stride: " << args->src_stride;
+                  log_gpudma.info() << "  count: " << args->count;
+                  log_gpudma.info() << "  args ptr: " << std::hex << (void*)args << std::dec;
                   
-                  // Query kernel attributes - if this fails, kernel is invalid for this context!
-                  int regs = 0, shmem = 0, lmem = 0;
-                  CUresult attr_res1 = CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
-                  CUresult attr_res2 = CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&shmem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel);
-                  CUresult attr_res3 = CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&lmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+                  // Log args buffer to verify it's valid memory
+                  log_gpudma.info() << "  Reduction args:";
+                  log_gpudma.info() << "    sizeof(redop_info): " << sizeof(redop_info);
+                  log_gpudma.info() << "    redop value at args: " << std::hex 
+                                    << *(reinterpret_cast<const uintptr_t*>(args)) << std::dec;
                   
-                  if(attr_res1 != CUDA_SUCCESS || attr_res2 != CUDA_SUCCESS || attr_res3 != CUDA_SUCCESS) {
-                    log_gpudma.error() << "  cuFuncGetAttribute FAILED: res1=" << attr_res1 
-                                       << " res2=" << attr_res2 << " res3=" << attr_res3;
-                    log_gpudma.error() << "  KERNEL IS INVALID FOR GPU" << channel->gpu->info->index << " CONTEXT!";
-                    log_gpudma.error() << "  This kernel likely belongs to a different GPU's context!";
+                  // Log device properties
+                  log_gpudma.info() << "  === DEVICE PROPERTIES ===";
+                  log_gpudma.info() << "  Device name: " << channel->gpu->info->name;
+                  log_gpudma.info() << "  Compute capability: " << channel->gpu->info->major << "." << channel->gpu->info->minor;
+                  log_gpudma.info() << "  Total global mem: " << channel->gpu->info->totalGlobalMem;
+                  
+                  // Query ALL kernel attributes to understand what's wrong
+                  int regs = 0, shmem = 0, lmem = 0, const_mem = 0;
+                  int max_threads = 0, ptx_ver = 0, binary_ver = 0;
+                  int cache_mode = 0, shared_mem_carveout = 0;
+                  
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&shmem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&lmem, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&const_mem, CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&max_threads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&ptx_ver, CU_FUNC_ATTRIBUTE_PTX_VERSION, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&binary_ver, CU_FUNC_ATTRIBUTE_BINARY_VERSION, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&cache_mode, CU_FUNC_ATTRIBUTE_CACHE_MODE_CA, kernel);
+                  CUDA_DRIVER_FNPTR(cuFuncGetAttribute)(&shared_mem_carveout, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, kernel);
+                  
+                  log_gpudma.info() << "  === FULL KERNEL ATTRIBUTES ===";
+                  log_gpudma.info() << "  regs/thread: " << regs;
+                  log_gpudma.info() << "  static_shmem: " << shmem;
+                  log_gpudma.info() << "  local_mem: " << lmem;
+                  log_gpudma.info() << "  const_mem: " << const_mem;
+                  log_gpudma.info() << "  max_threads_per_block: " << max_threads;
+                  log_gpudma.info() << "  ptx_version: " << ptx_ver;
+                  log_gpudma.info() << "  binary_version (SM): " << binary_ver;
+                  log_gpudma.info() << "  cache_mode: " << cache_mode;
+                  log_gpudma.info() << "  shared_mem_carveout: " << shared_mem_carveout;
+                  
+                  // Check if we're exceeding max_threads
+                  if(threads_per_block > static_cast<size_t>(max_threads)) {
+                    log_gpudma.fatal() << "  ERROR: threads_per_block (" << threads_per_block 
+                                       << ") > max_threads (" << max_threads << ")!";
                   }
                   
-                  log_gpudma.info() << "  kernel regs/thread: " << regs;
-                  log_gpudma.info() << "  kernel static_shmem: " << shmem;
-                  log_gpudma.info() << "  kernel local_mem: " << lmem;
+                  // Calculate total resource usage
+                  size_t total_regs = threads_per_block * regs;
+                  log_gpudma.info() << "  Total registers: " << total_regs 
+                                    << " (" << threads_per_block << " threads * " << regs << " regs)";
+                  log_gpudma.info() << "  H100 has 65536 regs/SM - this should work easily!";
+                  
+                  // Query occupancy to see what the driver thinks
+                  log_gpudma.info() << "  === OCCUPANCY QUERY ===";
+                  int num_blocks_per_sm = 0;
+                  CUresult occ_res = CUDA_DRIVER_FNPTR(cuOccupancyMaxActiveBlocksPerMultiprocessor)(
+                      &num_blocks_per_sm, kernel, threads_per_block, 0);
+                  log_gpudma.info() << "  cuOccupancyMaxActiveBlocksPerMultiprocessor result: " << occ_res;
+                  log_gpudma.info() << "  num_blocks_per_sm: " << num_blocks_per_sm;
+                  
+                  if(occ_res != CUDA_SUCCESS) {
+                    const char *err_name = nullptr, *err_string = nullptr;
+                    CUDA_DRIVER_FNPTR(cuGetErrorName)(occ_res, &err_name);
+                    CUDA_DRIVER_FNPTR(cuGetErrorString)(occ_res, &err_string);
+                    log_gpudma.error() << "  Occupancy query FAILED: " << err_name << " - " << err_string;
+                  } else if(num_blocks_per_sm == 0) {
+                    log_gpudma.error() << "  Occupancy query returned 0 blocks/SM - kernel is NOT LAUNCHABLE!";
+                  }
+                  
+                  // Try different thread counts to see what works
+                  log_gpudma.info() << "  === TESTING DIFFERENT THREAD COUNTS ===";
+                  for(int test_threads : {32, 64, 128, 256, 512, 1024}) {
+                    int test_blocks = 0;
+                    CUresult test_res = CUDA_DRIVER_FNPTR(cuOccupancyMaxActiveBlocksPerMultiprocessor)(
+                        &test_blocks, kernel, test_threads, 0);
+                    log_gpudma.info() << "    " << test_threads << " threads: blocks/SM=" << test_blocks 
+                                      << " (res=" << test_res << ")";
+                  }
+                  
+                  // As a last-ditch diagnostic, try launching with MINIMAL parameters
+                  // to see if it's a resource issue or something else
+                  log_gpudma.info() << "  === MINIMAL LAUNCH TEST ===";
+                  log_gpudma.info() << "  Attempting launch with 1 block, 1 thread...";
+                  void *test_extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, args,
+                                       CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
+                                       CU_LAUNCH_PARAM_END};
+                  CUresult test_result = CUDA_DRIVER_FNPTR(cuLaunchKernel)(
+                      kernel, 1, 1, 1, 1, 1, 1, 0, stream->get_stream(), NULL, test_extra);
+                  log_gpudma.info() << "  Minimal launch result: " << test_result;
+                  if(test_result != CUDA_SUCCESS) {
+                    const char *err_name = nullptr, *err_string = nullptr;
+                    CUDA_DRIVER_FNPTR(cuGetErrorName)(test_result, &err_name);
+                    CUDA_DRIVER_FNPTR(cuGetErrorString)(test_result, &err_string);
+                    log_gpudma.error() << "  Even 1 thread FAILS: " << err_name << " - " << err_string;
+                    log_gpudma.error() << "  This confirms the kernel binary is INVALID for this device!";
+                  } else {
+                    log_gpudma.info() << "  Minimal launch SUCCEEDED! The problem is resource-related.";
+                    // Wait for it to finish
+                    CHECK_CU(CUDA_DRIVER_FNPTR(cuStreamSynchronize)(stream->get_stream()));
+                    log_gpudma.info() << "  Minimal kernel execution completed successfully.";
+                  }
+                  
+                  // Only proceed with full launch if minimal test succeeded OR to gather more info
+                  log_gpudma.info() << "  === FULL LAUNCH ===";
                   
                   void *extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, args,
                                    CU_LAUNCH_PARAM_BUFFER_SIZE, &args_size,
                                    CU_LAUNCH_PARAM_END};
 
-                  log_gpudma.info() << "  Calling cuLaunchKernel...";
+                  log_gpudma.info() << "  Calling cuLaunchKernel with full parameters...";
+                  log_gpudma.info() << "    blocks: (" << blocks_per_grid << ", 1, 1)";
+                  log_gpudma.info() << "    threads: (" << threads_per_block << ", 1, 1)";
+                  log_gpudma.info() << "    shared_mem: 0";
+                  
                   CUresult launch_result = CUDA_DRIVER_FNPTR(cuLaunchKernel)(
                       kernel, blocks_per_grid, 1, 1, threads_per_block, 1, 1,
                       0 /*sharedmem*/, stream->get_stream(), 0 /*params*/, extra);
