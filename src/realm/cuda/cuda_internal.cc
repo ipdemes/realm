@@ -20,9 +20,6 @@
 #include "realm/cuda/cuda_access.h"
 #include "realm/cuda/cuda_memcpy.h"
 
-#include <sstream>
-#include <iomanip>
-
 namespace Realm {
 
   extern Logger log_xd;
@@ -2226,14 +2223,8 @@ namespace Realm {
       GPU *gpu = checked_cast<GPUreduceChannel *>(channel)->gpu;
       stream = gpu->get_next_d2d_stream();
 
-      log_gpudma.debug() << "GPUreduceXferDes: GPU" << gpu->info->index 
-                         << " redop=" << redop_info.id;
-
       {
         AutoLock<Mutex> al(gpu->alloc_mutex);
-        log_gpudma.info() << "  Checking GPU" << gpu->info->index << " reduction table (size=" 
-                          << gpu->gpu_reduction_table.size() << ")";
-        
         std::unordered_map<ReductionOpID, GPU::GPUReductionOpEntry>::const_iterator
             gpu_red_it = gpu->gpu_reduction_table.find(redop_info.id);
         if(gpu_red_it != gpu->gpu_reduction_table.end()) {
@@ -2242,18 +2233,10 @@ namespace Realm {
                                                    : gpu_red_it->second.fold_nonexcl)
                         : (redop_info.is_exclusive ? gpu_red_it->second.apply_excl
                                                    : gpu_red_it->second.apply_nonexcl));
-          log_gpudma.info() << "  FOUND cached kernel for GPU" << gpu->info->index 
-                            << " redop=" << redop_info.id 
-                            << " kernel=" << std::hex << (void*)kernel << std::dec;
-        } else {
-          log_gpudma.info() << "  NOT FOUND in cache for GPU" << gpu->info->index 
-                            << " redop=" << redop_info.id << " - will obtain new one";
         }
       }
 
       if(kernel == nullptr) {
-        log_gpudma.info() << "  Kernel is nullptr, obtaining via fallback";
-        
         // select reduction kernel now - translate to CUfunction if possible
         void *host_proxy =
             (redop_info.is_fold
@@ -2262,29 +2245,16 @@ namespace Realm {
                  : (redop_info.is_exclusive ? redop->cuda_apply_excl_fn
                                             : redop->cuda_apply_nonexcl_fn));
         
-        log_gpudma.info() << "  host_proxy=" << std::hex << host_proxy << std::dec;
-        log_gpudma.info() << "  cudaGetFuncBySymbol_fn=" << std::hex 
-                          << (void*)redop->cudaGetFuncBySymbol_fn << std::dec;
-        
         if(redop->cudaGetFuncBySymbol_fn != 0) {
           // we can ask the runtime to perform the mapping for us
-          // CRITICAL: Must be in the correct GPU context!
-          log_gpudma.info() << "  Calling cudaGetFuncBySymbol for GPU" << gpu->info->index;
-          log_gpudma.info() << "    GPU context=" << std::hex << (void*)gpu->context << std::dec;
-          
           gpu->push_context();
           
 #ifdef REALM_USE_CUDART_HIJACK
           ThreadLocal::current_gpu_stream = stream;
-          log_gpudma.info() << "    Set current_gpu_stream (hijack enabled)";
 #endif
           
           int result = reinterpret_cast<PFN_cudaGetFuncBySymbol>(
               redop->cudaGetFuncBySymbol_fn)((void **)&kernel, host_proxy);
-          
-          log_gpudma.info() << "    cudaGetFuncBySymbol returned: " << result;
-          log_gpudma.info() << "    Got kernel=" << std::hex << (void*)kernel << std::dec;
-          
           CHECK_CUDART(result);
           
           gpu->pop_context();
@@ -2293,12 +2263,6 @@ namespace Realm {
           {
             AutoLock<Mutex> al(gpu->alloc_mutex);
             GPU::GPUReductionOpEntry &entry = gpu->gpu_reduction_table[redop_info.id];
-            log_gpudma.info() << "  Registering kernel in GPU" << gpu->info->index << " reduction table";
-            log_gpudma.info() << "    Before: apply_excl=" << std::hex << (void*)entry.apply_excl
-                              << " apply_nonexcl=" << (void*)entry.apply_nonexcl
-                              << " fold_excl=" << (void*)entry.fold_excl
-                              << " fold_nonexcl=" << (void*)entry.fold_nonexcl << std::dec;
-            
             if(redop_info.is_fold) {
               if(redop_info.is_exclusive)
                 entry.fold_excl = kernel;
@@ -2310,24 +2274,15 @@ namespace Realm {
               else
                 entry.apply_nonexcl = kernel;
             }
-            
-            log_gpudma.info() << "    After: apply_excl=" << std::hex << (void*)entry.apply_excl
-                              << " apply_nonexcl=" << (void*)entry.apply_nonexcl
-                              << " fold_excl=" << (void*)entry.fold_excl
-                              << " fold_nonexcl=" << (void*)entry.fold_nonexcl << std::dec;
           }
         } else {
           // no way to ask the runtime to perform the mapping, so we'll have
           //  to actually launch the kernels with the runtime API using the launch
           //  kernel function provided
-          log_gpudma.info() << "  No cudaGetFuncBySymbol, using cudaLaunchKernel fallback";
           kernel_host_proxy = host_proxy;
           assert(redop->cudaLaunchKernel_fn != 0);
         }
       }
-      log_gpudma.info() << "=== GPUreduceXferDes constructor END: kernel=" 
-                        << std::hex << (void*)kernel 
-                        << " host_proxy=" << (void*)kernel_host_proxy << std::dec << " ===";
     }
 
     long GPUreduceXferDes::get_requests(Request **requests, long nr)
@@ -2354,9 +2309,7 @@ namespace Realm {
         uintptr_t count;
       };
       KernelArgs *args = 0; // allocate on demand
-      // Round up args_size to 8-byte alignment for proper CUDA parameter packing
       size_t args_size = sizeof(KernelArgs) + redop->sizeof_userdata;
-      args_size = (args_size + 7) & ~7;  // Align to 8 bytes
 
       while(true) {
         size_t min_xfer_size = 4096; // TODO: make controllable
@@ -2494,23 +2447,16 @@ namespace Realm {
                 AutoGPUContext agc(channel->gpu);
 
                 if(kernel != 0) {
-                  log_gpudma.debug() << "Launching reduction kernel: elems=" << elems
-                                     << " threads=" << threads_per_block 
-                                     << " blocks=" << blocks_per_grid;
-                  
-                  // Use params array - pass pointers to each parameter
+                  // Use params array to pass kernel arguments
+                  // This is more robust than CU_LAUNCH_PARAM_BUFFER_POINTER for small structs
                   void *params[] = {&args->dst_base,   &args->dst_stride, &args->src_base,
-                                    &args->src_stride, &args->count,      args + 1};
+                                    &args->src_stride, &args->count,      :/args + 1};
                   
                   CHECK_CU(CUDA_DRIVER_FNPTR(cuLaunchKernel)(
                       kernel, blocks_per_grid, 1, 1, threads_per_block, 1, 1,
                       0 /*sharedmem*/, stream->get_stream(), params, 0 /*extra*/));
                 } else {
-                  // For runtime API path, use conservative thread count
-                  threads_per_block = 128;
-                  blocks_per_grid = std::min(1 + ((elems - 1) / threads_per_block),
-                                             static_cast<size_t>(CUDA_MAX_BLOCKS_PER_GRID));
-                  
+                  // Runtime API path - also use params array
                   void *params[] = {&args->dst_base,   &args->dst_stride, &args->src_base,
                                     &args->src_stride, &args->count,      args + 1};
                   assert(redop->cudaLaunchKernel_fn != 0);
