@@ -2270,32 +2270,22 @@ namespace Realm {
         if(redop->cudaGetFuncBySymbol_fn != 0) {
           // we can ask the runtime to perform the mapping for us
           // CRITICAL: Must be in the correct GPU context!
-          CUcontext ctx_before, ctx_after, ctx_final;
-          CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&ctx_before);
-          
           log_gpudma.info() << "  Calling cudaGetFuncBySymbol for GPU" << gpu->info->index;
-          log_gpudma.info() << "    ctx_before_push=" << std::hex << (void*)ctx_before << std::dec;
           
           gpu->push_context();
-          CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&ctx_after);
-          
-          log_gpudma.info() << "    ctx_after_push=" << std::hex << (void*)ctx_after << std::dec;
           
 #ifdef REALM_USE_CUDART_HIJACK
           ThreadLocal::current_gpu_stream = stream;
           log_gpudma.info() << "    Set current_gpu_stream (hijack enabled)";
 #endif
           
-          CUresult result = reinterpret_cast<PFN_cudaGetFuncBySymbol>(
+          int result = reinterpret_cast<PFN_cudaGetFuncBySymbol>(
               redop->cudaGetFuncBySymbol_fn)((void **)&kernel, host_proxy);
           
           log_gpudma.info() << "    cudaGetFuncBySymbol returned: " << result;
           log_gpudma.info() << "    Got kernel=" << std::hex << (void*)kernel << std::dec;
           
           CHECK_CUDART(result);
-          
-          CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&ctx_final);
-          log_gpudma.info() << "    ctx_after_call=" << std::hex << (void*)ctx_final << std::dec;
           
           gpu->pop_context();
           
@@ -2502,13 +2492,9 @@ namespace Realm {
                 AutoGPUContext agc(channel->gpu);
 
                 if(kernel != 0) {
-                  CUcontext launch_ctx;
-                  CUDA_DRIVER_FNPTR(cuCtxGetCurrent)(&launch_ctx);
-                  
                   log_gpudma.info() << "=== KERNEL LAUNCH ===";
                   log_gpudma.info() << "  kernel ptr: " << std::hex << (void*)kernel << std::dec;
                   log_gpudma.info() << "  channel GPU: " << channel->gpu->info->index;
-                  log_gpudma.info() << "  launch ctx: " << std::hex << (void*)launch_ctx << std::dec;
                   log_gpudma.info() << "  stream: " << std::hex << (void*)stream->get_stream() << std::dec;
                   log_gpudma.info() << "  threads_per_block: " << threads_per_block;
                   log_gpudma.info() << "  blocks_per_grid: " << blocks_per_grid;
