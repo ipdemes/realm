@@ -20,6 +20,9 @@
 #include "realm/cuda/cuda_access.h"
 #include "realm/cuda/cuda_memcpy.h"
 
+#include <sstream>
+#include <iomanip>
+
 namespace Realm {
 
   extern Logger log_xd;
@@ -2509,11 +2512,27 @@ namespace Realm {
                   log_gpudma.info() << "  count: " << args->count;
                   log_gpudma.info() << "  args ptr: " << std::hex << (void*)args << std::dec;
                   
-                  // Log args buffer to verify it's valid memory
-                  log_gpudma.info() << "  Reduction args:";
-                  log_gpudma.info() << "    sizeof(redop_info): " << sizeof(redop_info);
-                  log_gpudma.info() << "    redop value at args: " << std::hex 
-                                    << *(reinterpret_cast<const uintptr_t*>(args)) << std::dec;
+                  // Log args buffer and redop info
+                  log_gpudma.info() << "  === REDUCTION OPERATOR INFO ===";
+                  log_gpudma.info() << "    redop->sizeof_userdata: " << redop->sizeof_userdata;
+                  log_gpudma.info() << "    redop->sizeof_lhs: " << redop->sizeof_lhs;
+                  log_gpudma.info() << "    redop->sizeof_rhs: " << redop->sizeof_rhs;
+                  log_gpudma.info() << "    redop->userdata ptr: " << std::hex << (void*)redop->userdata << std::dec;
+                  log_gpudma.info() << "    args_size calculated: " << args_size;
+                  log_gpudma.info() << "    sizeof(KernelArgs): " << sizeof(KernelArgs);
+                  log_gpudma.info() << "    args + 1 (redop location): " << std::hex << (void*)(args + 1) << std::dec;
+                  
+                  // Dump the actual bytes in the args buffer
+                  log_gpudma.info() << "    Args buffer contents (first 48 bytes):";
+                  const unsigned char *bytes = reinterpret_cast<const unsigned char*>(args);
+                  for(size_t i = 0; i < std::min(args_size, 48ul); i += 8) {
+                    std::ostringstream hex;
+                    hex << "      [" << i << "]: " << std::hex << std::setfill('0');
+                    for(size_t j = i; j < std::min(i + 8, args_size); j++) {
+                      hex << std::setw(2) << (int)bytes[j] << " ";
+                    }
+                    log_gpudma.info() << hex.str();
+                  }
                   
                   // Log device properties
                   log_gpudma.info() << "  === DEVICE PROPERTIES ===";
