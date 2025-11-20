@@ -2223,6 +2223,10 @@ namespace Realm {
       GPU *gpu = checked_cast<GPUreduceChannel *>(channel)->gpu;
       stream = gpu->get_next_d2d_stream();
 
+      // Per-GPU kernel caching: Check if we already have a kernel for this specific GPU
+      // IMPORTANT: CUfunction pointers are context-specific - a kernel obtained for
+      // GPU0's context cannot be used on GPU1's context. In multi-GPU setups, each GPU
+      // must have its own cached kernel obtained in the correct CUDA context.
       {
         AutoLock<Mutex> al(gpu->alloc_mutex);
         std::unordered_map<ReductionOpID, GPU::GPUReductionOpEntry>::const_iterator
@@ -2246,7 +2250,9 @@ namespace Realm {
                                             : redop->cuda_apply_nonexcl_fn));
         
         if(redop->cudaGetFuncBySymbol_fn != 0) {
-          // we can ask the runtime to perform the mapping for us
+          // We can ask the runtime to perform the mapping for us
+          // CRITICAL: Must obtain the kernel within the correct GPU's CUDA context
+          // to ensure the CUfunction pointer is valid for this specific GPU
           gpu->push_context();
           
 #ifdef REALM_USE_CUDART_HIJACK
@@ -2259,7 +2265,9 @@ namespace Realm {
           
           gpu->pop_context();
           
-          // Register this kernel in the GPU's reduction table for future use
+          // Cache this kernel in the GPU's local reduction table for future reuse
+          // This avoids repeated cudaGetFuncBySymbol calls and ensures each GPU
+          // has its own context-specific kernel instance
           {
             AutoLock<Mutex> al(gpu->alloc_mutex);
             GPU::GPUReductionOpEntry &entry = gpu->gpu_reduction_table[redop_info.id];
@@ -2447,8 +2455,12 @@ namespace Realm {
                 AutoGPUContext agc(channel->gpu);
 
                 if(kernel != 0) {
-                  // Use params array to pass kernel arguments
-                  // This is more robust than CU_LAUNCH_PARAM_BUFFER_POINTER for small structs
+                  // Use params array to pass kernel arguments (pointers to each parameter)
+                  // instead of CU_LAUNCH_PARAM_BUFFER_POINTER (packed buffer).
+                  // The params array method is more robust for reduction operators with small
+                  // userdata structs (e.g., 1-byte REDOP structs), as it avoids alignment
+                  // issues that can cause CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES (error 701).
+                  // The last parameter (args + 1) points to the REDOP struct stored after KernelArgs.
                   void *params[] = {&args->dst_base,   &args->dst_stride, &args->src_base,
                                     &args->src_stride, &args->count,      args + 1};
                   
@@ -2456,7 +2468,7 @@ namespace Realm {
                       kernel, blocks_per_grid, 1, 1, threads_per_block, 1, 1,
                       0 /*sharedmem*/, stream->get_stream(), params, 0 /*extra*/));
                 } else {
-                  // Runtime API path - also use params array
+                  // Runtime API fallback path - also use params array for consistency
                   void *params[] = {&args->dst_base,   &args->dst_stride, &args->src_base,
                                     &args->src_stride, &args->count,      args + 1};
                   assert(redop->cudaLaunchKernel_fn != 0);
